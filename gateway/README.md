@@ -22,7 +22,7 @@
 - 收到文本回复显示在屏幕；收到合规 PCM 回复通过扬声器播放。
 - 默认半双工交互，不在听取用户录音时播放回复。
 - Wi-Fi/Gateway 断线重试。未配置模型时服务明确报错，不伪造回复。
-- 不把语音、聊天内容、Wi-Fi 密码、Gateway Token 写入日志或文件；配置只保存在设备 NVS。
+- 设备不持久保存录音或聊天；配置保存在设备 NVS。Gateway 不持久保存语音/聊天，不记录密码或 Token。
 
 ## Gateway 启动
 
@@ -48,11 +48,46 @@ chmod 600 .env
 
 必须自己指定 `MODEL_NAME`，没有默认模型，也不会自动选 Astra。
 `MODEL_TOKEN_FIELD` 默认 `max_tokens`；只接受 `max_tokens` 或 `max_completion_tokens`，按目标服务设置。
+`MODEL_MAX_TOKENS`、`MODEL_TEMPERATURE`、`MODEL_TOP_P` 可按服务配置。
+本轮 Lenovo Qwen 语音模式使用 `MODEL_ENABLE_THINKING=false`，通过
+`chat_template_kwargs.enable_thinking` 控制模板；实测顶层 `enable_thinking` 没有关闭其思考。
+关闭思考能避免短语音回复的 token 预算耗在思考上而没有可播报的文本。
 不同模型的参数兼容性要以真实端点测试为准，适配器测试不能证明每个模型账号可用。
 
 语音需要独立配置 `ASR_*` 与 `TTS_*`：当前适配 OpenAI-compatible transcription 和 speech 接口。
 TTS 服务必须返回 PCM16LE 单声道，配置实际采样率（默认 24 kHz），Gateway 转为设备的 16 kHz。
 某个模型可接文本并不代表它自带 ASR/TTS。没有 ASR 时不会把麦克风数据发给云端。
+
+### Mac 本地语音模式（无需第二枚云端 Key）
+
+```text
+StickS3 PCM录音 → Mac Whisper.cpp 转文字 → Qwen文本接口
+                                            ↓
+StickS3扬声器 ← 16kHz mono PCM ← Mac say 中文语音 ← 文本回复
+```
+
+本机存在 `whisper-cli` 和模型时可直接复用；不会修改已有模型。
+在私有 `.env` 设置：
+
+```dotenv
+ASR_PROVIDER=whisper-cpp
+WHISPER_MODEL_PATH=/absolute/path/to/ggml-small.bin
+WHISPER_CLI=whisper-cli
+ASR_LANGUAGE=zh
+TTS_PROVIDER=macos-say
+MACOS_SAY_VOICE=Tingting
+```
+
+Mac 还需要 `ffmpeg`。Whisper 每次以受控子进程识别最多 10 秒音频，使用两个 CPU 线程，
+本地语音任务串行执行；不另外开放识别服务端口。`say` 合成后转换为 16 kHz、单声道 PCM16LE，
+设备沿用现有二进制音频协议，不需要因换 ASR/TTS 再刷固件。单次语音回复最多 30 秒。
+
+识别和合成阶段使用权限受限的临时 WAV/AIFF/JSON/PCM 文件，成功或失败后删除；不持久保存。
+可用 `SPEECH_TMP_DIR` 指定自己的私有工作目录。
+此模式只把**识别后的文字**发送到模型接口，原始用户录音不发往云端 ASR。
+第一版需要 Mac 开着且设备能访问 Mac 的局域网地址；以后迁移服务器时可换成独立 ASR/TTS 服务。
+
+健康检查会分别报告模型、ASR、TTS 配置状态，但“已配置”不等于设备完整链路已验收。
 
 ## USB 配网
 

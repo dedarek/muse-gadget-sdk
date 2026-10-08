@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import sys
+import shutil
+import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,10 +34,20 @@ class Settings:
     api_key: str = ""
     model: str = ""
     token_field: str = "max_tokens"
+    max_tokens: int = 160
+    temperature: float | None = None
+    top_p: float | None = None
+    enable_thinking: bool | None = None
     asr_base: str = ""
+    asr_provider: str = "openai-compatible"
+    whisper_model: str = ""
+    whisper_cli: str = "whisper-cli"
+    asr_language: str = "zh"
     asr_key: str = ""
     asr_model: str = ""
     tts_base: str = ""
+    tts_provider: str = "openai-compatible"
+    say_voice: str = "Tingting"
     tts_key: str = ""
     tts_model: str = ""
     tts_voice: str = ""
@@ -50,10 +62,20 @@ class Settings:
             api_key=os.getenv("MODEL_API_KEY", ""),
             model=os.getenv("MODEL_NAME", ""),
             token_field=os.getenv("MODEL_TOKEN_FIELD", "max_tokens"),
+            max_tokens=int(os.getenv("MODEL_MAX_TOKENS", "160")),
+            temperature=float(os.environ["MODEL_TEMPERATURE"]) if os.getenv("MODEL_TEMPERATURE") else None,
+            top_p=float(os.environ["MODEL_TOP_P"]) if os.getenv("MODEL_TOP_P") else None,
+            enable_thinking=os.environ["MODEL_ENABLE_THINKING"].lower() == "true" if os.getenv("MODEL_ENABLE_THINKING") else None,
             asr_base=os.getenv("ASR_BASE_URL", ""),
+            asr_provider=os.getenv("ASR_PROVIDER", "openai-compatible"),
+            whisper_model=os.getenv("WHISPER_MODEL_PATH", ""),
+            whisper_cli=os.getenv("WHISPER_CLI", "whisper-cli"),
+            asr_language=os.getenv("ASR_LANGUAGE", "zh"),
             asr_key=os.getenv("ASR_API_KEY", ""),
             asr_model=os.getenv("ASR_MODEL", ""),
             tts_base=os.getenv("TTS_BASE_URL", ""),
+            tts_provider=os.getenv("TTS_PROVIDER", "openai-compatible"),
+            say_voice=os.getenv("MACOS_SAY_VOICE", "Tingting"),
             tts_key=os.getenv("TTS_API_KEY", ""),
             tts_model=os.getenv("TTS_MODEL", ""),
             tts_voice=os.getenv("TTS_VOICE", ""),
@@ -107,11 +129,49 @@ def resample_pcm(pcm, input_rate, output_rate=16000):
     return dst.tobytes()
 
 
+async def local_command(*args, input_bytes=None):
+    """No shell, no transcript in argv/logs, bounded execution and cleanup."""
+    try:
+        process = await asyncio.create_subprocess_exec(*args,
+            stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except (FileNotFoundError, PermissionError) as error:
+        raise GatewayError("local speech executable unavailable") from error
+    try:
+        stdout, _stderr = await asyncio.wait_for(process.communicate(input_bytes), timeout=60)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+    if process.returncode:
+        raise GatewayError("local speech command failed; check installed voice/model")
+    return stdout
+
+
+def speech_tempdir():
+    return tempfile.TemporaryDirectory(prefix="yyc-audio-", dir=os.getenv("SPEECH_TMP_DIR") or None)
+
+
+def speech_readiness(cfg):
+    if cfg.asr_provider == "whisper-cpp":
+        asr = bool(cfg.whisper_model and Path(cfg.whisper_model).is_file() and shutil.which(cfg.whisper_cli))
+    else:
+        asr = bool(cfg.asr_base and cfg.asr_model)
+    if cfg.tts_provider == "macos-say":
+        tts = sys.platform == "darwin" and bool(shutil.which("say") and shutil.which("ffmpeg"))
+    else:
+        tts = bool(cfg.tts_base and cfg.tts_model and cfg.tts_voice)
+    return {"asr_configured": asr, "tts_configured": tts,
+            "asr_provider": cfg.asr_provider, "tts_provider": cfg.tts_provider}
+
+
 class Providers:
     def __init__(self, cfg, client=None):
         self.cfg = cfg
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10), follow_redirects=False)
         self.owns_client = client is None
+        self.local_speech_lock = asyncio.Semaphore(1)
 
     async def close(self):
         if self.owns_client:
@@ -122,13 +182,15 @@ class Providers:
         c = self.cfg
         if not c.base_url or not c.model:
             raise GatewayError("model endpoint/name not configured; no cloud call made")
-        system = "You are a portable voice assistant. Reply concisely in the user's language, no markdown."
+        system = ("You are a portable voice assistant that answers questions in conversation only. "
+                  "Do not claim to operate devices, browse or schedule reminders. "
+                  "Reply briefly in the user's language, preferably one sentence, no markdown.")
         if c.provider == "anthropic":
             if not c.api_key:
                 raise GatewayError("Claude API key not configured")
             response = await self.client.post(endpoint(c.base_url, "messages"),
                 headers={"x-api-key": c.api_key, "anthropic-version": "2023-06-01"},
-                json={"model": c.model, "max_tokens": 160, "system": system,
+                json={"model": c.model, "max_tokens": c.max_tokens, "system": system,
                       "messages": [{"role": "user", "content": text}]})
             response.raise_for_status()
             reply = "".join(x.get("text", "") for x in response.json().get("content", []) if x.get("type") == "text")
@@ -136,9 +198,16 @@ class Providers:
             if c.token_field not in ("max_tokens", "max_completion_tokens"):
                 raise GatewayError("invalid MODEL_TOKEN_FIELD")
             headers = {"Authorization": f"Bearer {c.api_key}"} if c.api_key else {}
+            payload = {"model": c.model, "messages": [{"role": "system", "content": system},
+                {"role": "user", "content": text}], c.token_field: c.max_tokens}
+            if c.temperature is not None:
+                payload["temperature"] = c.temperature
+            if c.top_p is not None:
+                payload["top_p"] = c.top_p
+            if c.enable_thinking is not None:
+                payload["chat_template_kwargs"] = {"enable_thinking": c.enable_thinking}
             response = await self.client.post(endpoint(c.base_url, "chat/completions"), headers=headers,
-                json={"model": c.model, "messages": [{"role": "system", "content": system},
-                    {"role": "user", "content": text}], c.token_field: 160})
+                json=payload)
             response.raise_for_status()
             reply = response.json()["choices"][0]["message"]["content"]
         else:
@@ -151,6 +220,25 @@ class Providers:
     async def transcribe(self, pcm):
         c = self.cfg
         wav = pcm_to_wav(pcm)
+        if c.asr_provider == "whisper-cpp":
+            if not c.whisper_model or not Path(c.whisper_model).is_file():
+                raise GatewayError("local Whisper model not configured")
+            async with self.local_speech_lock:
+                with speech_tempdir() as directory:
+                    source = Path(directory) / "input.wav"
+                    prefix = Path(directory) / "result"
+                    source.write_bytes(wav)
+                    await local_command(c.whisper_cli, "-m", c.whisper_model, "-f", str(source),
+                        "-l", c.asr_language, "-t", "2", "-bs", "1", "-bo", "1",
+                        "-nt", "-np", "-oj", "-of", str(prefix))
+                    try:
+                        result = json.loads(prefix.with_suffix(".json").read_text())
+                        text = "".join(segment.get("text", "") for segment in result.get("transcription", []))
+                    except (OSError, ValueError, AttributeError) as error:
+                        raise GatewayError("local ASR returned invalid output") from error
+                    return validate_text(text)
+        if c.asr_provider != "openai-compatible":
+            raise GatewayError("unsupported ASR_PROVIDER")
         if not c.asr_base or not c.asr_model:
             raise GatewayError("ASR not configured; microphone data was not sent to a provider")
         headers = {"Authorization": f"Bearer {c.asr_key}"} if c.asr_key else {}
@@ -161,6 +249,23 @@ class Providers:
 
     async def speech(self, text):
         c = self.cfg
+        if c.tts_provider == "macos-say":
+            if sys.platform != "darwin":
+                raise GatewayError("macos-say requires a Mac Gateway host")
+            async with self.local_speech_lock:
+                with speech_tempdir() as directory:
+                    source = Path(directory) / "reply.aiff"
+                    target = Path(directory) / "reply.pcm"
+                    await local_command("say", "-v", c.say_voice, "-r", "190", "-o", str(source), "-f", "-",
+                                        input_bytes=text.encode("utf-8"))
+                    await local_command("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                        "-i", str(source), "-t", "30", "-ac", "1", "-ar", "16000", "-f", "s16le", str(target))
+                    pcm = target.read_bytes()
+                    if not pcm or len(pcm) % 2 or len(pcm) > 16000 * 2 * 30:
+                        raise GatewayError("local TTS returned invalid PCM")
+                    return pcm
+        if c.tts_provider != "openai-compatible":
+            raise GatewayError("unsupported TTS_PROVIDER")
         if not c.tts_base or not c.tts_model or not c.tts_voice:
             return None
         headers = {"Authorization": f"Bearer {c.tts_key}"} if c.tts_key else {}
@@ -200,8 +305,7 @@ def create_app(cfg, providers=None):
     async def health(request):
         return web.json_response({"ok": True, "backend": "yyc", "muse_backend": False,
             "model_configured": bool(cfg.base_url and cfg.model),
-            "asr_configured": bool(cfg.asr_base and cfg.asr_model),
-            "tts_configured": bool(cfg.tts_base and cfg.tts_model and cfg.tts_voice)})
+            **speech_readiness(cfg)})
 
     async def chat(request):
         try:

@@ -3,6 +3,8 @@ import json
 import struct
 import unittest
 import sys
+import tempfile
+from unittest.mock import patch
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
@@ -121,6 +123,58 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_model_parameters(self):
+        def handler(request):
+            data = json.loads(request.content)
+            self.assertEqual(data["max_tokens"], 512)
+            self.assertEqual(data["temperature"], .7)
+            self.assertEqual(data["top_p"], .95)
+            self.assertEqual(data["chat_template_kwargs"], {"enable_thinking": False})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cfg = Settings(TOKEN, base_url="https://test.invalid/v1", model="test-model", max_tokens=512,
+                temperature=.7, top_p=.95, enable_thinking=False)
+            self.assertEqual(await Providers(cfg, client).chat("hello"), "ok")
+    async def test_local_whisper_temporary_files_removed(self):
+        seen = []
+        async def command(*args, **kwargs):
+            wav = Path(args[args.index("-f") + 1])
+            self.assertEqual(wav.read_bytes()[:4], b"RIFF")
+            seen.append(wav)
+            prefix = Path(args[args.index("-of") + 1])
+            prefix.with_suffix(".json").write_text(json.dumps({"transcription": [{"text": " 本地识别测试 "}]}))
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "test-model.bin"
+            model.write_bytes(b"mocked model")
+            cfg = Settings(TOKEN, asr_provider="whisper-cpp", whisper_model=str(model))
+            p = Providers(cfg)
+            with patch("server.local_command", side_effect=command):
+                self.assertEqual(await p.transcribe(bytes(3200)), "本地识别测试")
+            self.assertTrue(all(not path.exists() for path in seen))
+            await p.close()
+    async def test_local_tts_passes_text_stdin_and_cleans_up(self):
+        seen = []
+        async def command(*args, **kwargs):
+            if args[0] == "say":
+                self.assertEqual(kwargs["input_bytes"], "你好".encode())
+                self.assertNotIn("你好", args)
+                target = Path(args[args.index("-o") + 1])
+                target.write_bytes(b"mock AIFF")
+            else:
+                self.assertEqual(args[0], "ffmpeg")
+                target = Path(args[-1])
+                target.write_bytes(bytes(3200))
+            seen.append(target)
+        p = Providers(Settings(TOKEN, tts_provider="macos-say"))
+        with patch("server.sys.platform", "darwin"), patch("server.local_command", side_effect=command):
+            self.assertEqual(len(await p.speech("你好")), 3200)
+        self.assertTrue(all(not path.exists() for path in seen))
+        await p.close()
+    async def test_missing_local_asr_model_is_error(self):
+        p = Providers(Settings(TOKEN, asr_provider="whisper-cpp"))
+        with self.assertRaises(GatewayError):
+            await p.transcribe(bytes(3200))
+        await p.close()
     async def test_openai_compatible(self):
         def handler(request):
             self.assertEqual(request.url.path, "/v1/chat/completions")
