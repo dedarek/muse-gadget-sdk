@@ -1,0 +1,4 @@
+aiohttp>=3.12,<4
+httpx>=0.28,<1
+python-dotenv>=1,<2
+pyserial>=3.5,<4

@@ -24,3 +24,9 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+# YYC Gateway local build products and secrets.
+/gateway/.env
+/gateway-firmware/managed_components/
+/gateway-firmware/sdkconfig
+/gateway-firmware/sdkconfig.old
