@@ -123,6 +123,26 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chinese_input_prompt_and_reply_are_simplified(self):
+        def handler(request):
+            payload=json.loads(request.content)
+            messages=payload.get("messages", [])
+            self.assertEqual(messages[-1]["content"], "请介绍自己")
+            self.assertIn("Simplified Chinese", payload.get("system", messages[0]["content"]))
+            if request.url.path.endswith("messages"):
+                return httpx.Response(200, json={"content":[{"type":"text", "text":"這是語音助手的測試。"}]})
+            return httpx.Response(200, json={"choices":[{"message":{"content":"這是語音助手的測試。"}}]})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for backend in ("anthropic", "openai-compatible"):
+                cfg=Settings(TOKEN, provider=backend, base_url="https://test.invalid/v1", api_key="test-key", model="test")
+                self.assertEqual(await Providers(cfg,client).chat("請介紹自己"), "这是语音助手的测试。")
+
+    async def test_cloud_asr_is_simplified(self):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200,json={"text":"你好，請簡單介紹你自己。"}))) as client:
+            cfg=Settings(TOKEN,asr_base="https://test.invalid/v1",asr_model="test")
+            self.assertEqual(await Providers(cfg,client).transcribe(bytes(3200)), "你好，请简单介绍你自己。")
+
     async def test_custom_model_parameters(self):
         def handler(request):
             data = json.loads(request.content)
@@ -142,7 +162,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(wav.read_bytes()[:4], b"RIFF")
             seen.append(wav)
             prefix = Path(args[args.index("-of") + 1])
-            prefix.with_suffix(".json").write_text(json.dumps({"transcription": [{"text": " 本地识别测试 "}]}))
+            prefix.with_suffix(".json").write_text(json.dumps({"transcription": [{"text": " 本地識別測試 "}]}))
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / "test-model.bin"
             model.write_bytes(b"mocked model")

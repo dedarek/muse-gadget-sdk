@@ -7,9 +7,10 @@
 
 - 原封不动复用 Muse StickS3 的 LCD、背光、ES8311 音频、M5PM1 电源/电池、两按键驱动。
 - 使用 Bosch 官方 BMI270 SensorAPI 增加 IMU 初始化、加速度/角速度读取；其 BSD 许可证和上游提交号保留在 `gateway-firmware/components/yyc_hardware/bosch/`。
-- 只编译硬件文件、字体和少量硬件状态钩子。**不编译 Muse app、Muse 账户、Muse BLE 配对、Noise/VM 客户端和 Muse OTA**。
+- 编译硬件、字体、原版 `esp32/avatar/muse_pixel.c` 形象渲染器和少量硬件状态钩子。**不编译 Muse app、Muse 账户、Muse BLE 配对、Noise/VM 客户端和 Muse OTA**。
 - 自有固件在 `gateway-firmware/`，不改变 `esp32/` 的官方固件代码。不会烧写 eFuse、启用 Secure Boot 或 Flash Encryption。
-- UI 是独立的状态/中文文本 UI，不是完整移植 Muse 的头像与设置菜单。
+- UI 恢复原版 Muse 像素形象及待命/聆听/思考/说话/异常动画，保留独立的网络、电池、中文字幕布局；**不是完整移植原版设置菜单与账户 UI**。原版形象的版权及许可声明保持不变。
+- 网关通过 OpenCC `t2s` 将 ASR 和模型回复统一转换为简体中文，模型提示词也明确要求简体；英文等非中文内容不翻译。
 - 当前 HTTP 接口提供文本对话；完整语音收发使用 WebSocket。USB 配网不需要 Muse Token。
 
 ## 已实现的设备行为
@@ -20,6 +21,7 @@
 - 正面键按住录音、松开发送；最大 10 秒，16 kHz / mono / PCM16LE。
 - 侧键输出设备状态。
 - 收到文本回复显示在屏幕；收到合规 PCM 回复通过扬声器播放。
+- 字幕显示三行自动换行简体中文，超长部分显示省略号；语音仍播放完整回复。
 - 默认半双工交互，不在听取用户录音时播放回复。
 - Wi-Fi/Gateway 断线重试。未配置模型时服务明确报错，不伪造回复。
 - 设备不持久保存录音或聊天；配置保存在设备 NVS。Gateway 不持久保存语音/聊天，不记录密码或 Token。

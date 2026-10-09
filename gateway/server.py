@@ -16,10 +16,12 @@ from pathlib import Path
 import httpx
 from aiohttp import web, WSMsgType
 from dotenv import load_dotenv
+from opencc import OpenCC
 
 LOG = logging.getLogger("yyc.gateway")
 MAX_AUDIO_BYTES = 16000 * 2 * 10
 MAX_TEXT = 2048
+SIMPLIFIED = OpenCC("t2s")
 
 
 class GatewayError(Exception):
@@ -178,13 +180,14 @@ class Providers:
             await self.client.aclose()
 
     async def chat(self, text):
-        text = validate_text(text)
+        text = SIMPLIFIED.convert(validate_text(text))
         c = self.cfg
         if not c.base_url or not c.model:
             raise GatewayError("model endpoint/name not configured; no cloud call made")
         system = ("You are a portable voice assistant that answers questions in conversation only. "
                   "Do not claim to operate devices, browse or schedule reminders. "
-                  "Reply briefly in the user's language, preferably one sentence, no markdown.")
+                  "Reply briefly in the user's language, preferably one sentence, no markdown. "
+                  "For Chinese, always use Simplified Chinese (简体中文), never Traditional Chinese.")
         if c.provider == "anthropic":
             if not c.api_key:
                 raise GatewayError("Claude API key not configured")
@@ -215,7 +218,7 @@ class Providers:
         if not isinstance(reply, str) or not reply.strip():
             raise GatewayError("provider returned no text")
         # Fit one device JSON message including metadata. Truncate on a UTF-8 boundary.
-        return reply.encode("utf-8")[:1800].decode("utf-8", "ignore")
+        return SIMPLIFIED.convert(reply).encode("utf-8")[:1800].decode("utf-8", "ignore")
 
     async def transcribe(self, pcm):
         c = self.cfg
@@ -236,7 +239,7 @@ class Providers:
                         text = "".join(segment.get("text", "") for segment in result.get("transcription", []))
                     except (OSError, ValueError, AttributeError) as error:
                         raise GatewayError("local ASR returned invalid output") from error
-                    return validate_text(text)
+                    return SIMPLIFIED.convert(validate_text(text))
         if c.asr_provider != "openai-compatible":
             raise GatewayError("unsupported ASR_PROVIDER")
         if not c.asr_base or not c.asr_model:
@@ -245,7 +248,7 @@ class Providers:
         response = await self.client.post(endpoint(c.asr_base, "audio/transcriptions"), headers=headers,
             data={"model": c.asr_model}, files={"file": ("speech.wav", wav, "audio/wav")})
         response.raise_for_status()
-        return validate_text(response.json().get("text"))
+        return SIMPLIFIED.convert(validate_text(response.json().get("text")))
 
     async def speech(self, text):
         c = self.cfg

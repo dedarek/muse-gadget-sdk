@@ -2,3 +2,4 @@ aiohttp>=3.12,<4
 httpx>=0.28,<1
 python-dotenv>=1,<2
 pyserial>=3.5,<4
+opencc-python-reimplemented>=0.1.7,<0.2

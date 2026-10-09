@@ -29,6 +29,7 @@
 #include "imu.h"
 #include "muse_audio.h"
 #include "muse_board.h"
+#include "yyc_ui.h"
 
 #define MAX_AUDIO_FRAMES (MUSE_AUDIO_RATE * 10)
 #define MAX_REPLY 4096
@@ -41,21 +42,13 @@ static atomic_bool s_test_requested;
 static atomic_bool s_enterprise_active, s_enterprise_configuring;
 static atomic_int s_wifi_reason;
 static char *s_enterprise_ca; /* EAP API borrows this public CA pointer. RAM only. */
-static lv_obj_t *s_label;
-static lv_font_t s_font;
-LV_FONT_DECLARE(muse_font_cjk_16);
 static bool s_imu_ok;
 typedef struct { int16_t *pcm; size_t frames; char *text; } upload_t;
 typedef struct { int16_t *pcm; size_t frames; } playback_t;
 static QueueHandle_t s_uploads, s_playback;
 
-static void ui(const char *text)
-{
-    if (s_label && muse_board->display_lock(300)) {
-        lv_label_set_text(s_label, text);
-        muse_board->display_unlock();
-    }
-}
+static void ui(const char *text) { yyc_ui_caption(text); }
+static void ui_mode(const char *text, muse_mode_t mode) { yyc_ui_mode(mode); ui(text); }
 static void usb_json(cJSON *j)
 {
     char *s = cJSON_PrintUnformatted(j);
@@ -81,7 +74,10 @@ static void status(bool send_ws)
         char address[16]; snprintf(address, sizeof(address), IPSTR, IP2STR(&ip.ip));
         cJSON_AddStringToObject(j, "ip", address);
     }
-    cJSON_AddBoolToObject(j, "display_initialized", s_label != NULL);
+    cJSON_AddBoolToObject(j, "display_initialized", yyc_ui_ready());
+    cJSON_AddBoolToObject(j, "avatar", yyc_ui_ready());
+    cJSON_AddNumberToObject(j, "avatar_frames", yyc_ui_frames());
+    cJSON_AddNumberToObject(j, "avatar_mode", yyc_ui_current_mode());
     cJSON_AddBoolToObject(j, "audio", atomic_load(&s_audio_ok));
     cJSON_AddBoolToObject(j, "imu", s_imu_ok);
     cJSON_AddNumberToObject(j, "psram_bytes", esp_psram_get_size());
@@ -115,7 +111,7 @@ static void hardware_test(void)
     ESP_LOGI(TAG, "PSRAM pattern test: %s", memory_ok ? "PASS" : "FAIL");
     if (atomic_load(&s_audio_ok)) { muse_audio_selftest(); muse_audio_chirp(1); }
     status(false);
-    ui("YYC StickS3\nHardware ready\nFront: hold to talk\nSide: status/test\nUSB setup required");
+    ui_mode("按住正面键说话\n松开发送\n等待网络连接", MUSE_MODE_IDLE);
     ESP_LOGI(TAG, "hardware test END; no claim of physical button/visual verification");
 }
 static bool copy_json(cJSON *j, const char *key, char *dst, size_t cap)
@@ -183,10 +179,10 @@ static void enterprise_configure(cJSON *request)
     if (err==ESP_OK) err=esp_wifi_sta_enterprise_enable();
     strlcpy(s_ssid,ssid,sizeof(s_ssid)); wipe(s_password,sizeof(s_password));
     atomic_store(&s_enterprise_configuring,false);
-    if (err==ESP_OK) { ui("Enterprise Wi-Fi\nAuthenticating...\nOne attempt only"); err=esp_wifi_connect(); }
+    if (err==ESP_OK) { ui("企业无线网络\n正在认证"); err=esp_wifi_connect(); }
     printf("@yyc {\"type\":\"enterprise\",\"ok\":%s,\"error\":\"%s\",\"credentials_persisted\":false,\"server_validation\":true}\n",
         err==ESP_OK?"true":"false",esp_err_to_name(err)); fflush(stdout);
-    if (err!=ESP_OK) ui("Enterprise setup failed\nNo automatic retry\nCheck local tool");
+    if (err!=ESP_OK) ui_mode("企业网络认证失败\n请检查电脑端",MUSE_MODE_ERROR);
     wipe(username,sizeof(username));wipe(identity,sizeof(identity));
     /* No NVS writes: password is copied by EAP into volatile RAM only.
      * Reboot restores the previous non-enterprise Wi-Fi configuration. */
@@ -324,6 +320,7 @@ static void serial_task(void *p)
                 else if (!strcmp(cmd->valuestring,"enterprise.configure")) enterprise_configure(j);
                 else if (!strcmp(cmd->valuestring,"gateway.session")) gateway_session(j);
                 else if (!strcmp(cmd->valuestring,"status")) status(false);
+                else if (!strcmp(cmd->valuestring,"snapshot")) yyc_ui_snapshot();
                 else if (!strcmp(cmd->valuestring,"test")) atomic_store(&s_test_requested,true);
                 else if (!strcmp(cmd->valuestring,"say")) {
                     cJSON *v=cJSON_GetObjectItemCaseSensitive(j,"text");
@@ -351,15 +348,15 @@ static void wifi_event(void *p,esp_event_base_t base,int32_t id,void *data)
         atomic_store(&s_wifi,true);
         ip_event_got_ip_t *e=data;
         ESP_LOGI(TAG,"Wi-Fi IP: " IPSTR,IP2STR(&e->ip_info.ip));
-        ui(s_uri[0] ? "Wi-Fi connected\nGateway connecting..." : "Wi-Fi connected\nUSB network check");
+        ui(s_uri[0] ? "网络已连接\n正在连接网关" : "网络已连接\n等待网关配置");
     } else if (base==WIFI_EVENT && id==WIFI_EVENT_STA_DISCONNECTED) {
         atomic_store(&s_wifi,false); atomic_store(&s_connected,false);
         wifi_event_sta_disconnected_t *e=data;
         atomic_store(&s_wifi_reason,e ? e->reason : 0);
         if (atomic_load(&s_enterprise_active) && !atomic_load(&s_enterprise_configuring)) {
             ESP_LOGW(TAG,"Enterprise disconnect reason=%u; no automatic credential retry",e?e->reason:0);
-            ui("Enterprise Wi-Fi failed\nNo automatic retry\nCheck local tool");
-        } else ui("Wi-Fi disconnected\nRetrying...");
+            ui_mode("企业网络断开\n请检查电脑端",MUSE_MODE_ERROR);
+        } else ui_mode("网络断开\n正在重连",MUSE_MODE_ERROR);
     }
 }
 static void ws_message(const char *data)
@@ -371,12 +368,12 @@ static void ws_message(const char *data)
         if (!strcmp(type->valuestring,"reply") || !strcmp(type->valuestring,"error")) {
             cJSON *t=cJSON_GetObjectItemCaseSensitive(j,"text");
             if (!cJSON_IsString(t)) t=cJSON_GetObjectItemCaseSensitive(j,"message");
-            if (cJSON_IsString(t)) { ui(t->valuestring); ESP_LOGI(TAG,"Gateway %s received",type->valuestring); }
-        } else if (!strcmp(type->valuestring,"ready")) ui("Gateway ready\nHold front to talk");
+            if (cJSON_IsString(t)) { ui_mode(t->valuestring,!strcmp(type->valuestring,"error")?MUSE_MODE_ERROR:MUSE_MODE_IDLE); ESP_LOGI(TAG,"Gateway %s received",type->valuestring); }
+        } else if (!strcmp(type->valuestring,"ready")) ui_mode("按住正面键\n说话后松开发送",MUSE_MODE_IDLE);
         else if (!strcmp(type->valuestring,"audio.start")) {
             cJSON *rate=cJSON_GetObjectItemCaseSensitive(j,"sample_rate");
             cJSON *channels=cJSON_GetObjectItemCaseSensitive(j,"channels");
-            if (cJSON_IsNumber(rate) && rate->valueint==16000 && cJSON_IsNumber(channels) && channels->valueint==1 && !atomic_load(&s_record)) atomic_store(&s_playing,true);
+            if (cJSON_IsNumber(rate) && rate->valueint==16000 && cJSON_IsNumber(channels) && channels->valueint==1 && !atomic_load(&s_record)) { atomic_store(&s_playing,true); yyc_ui_mode(MUSE_MODE_SPEAKING); }
         } else if (!strcmp(type->valuestring,"audio.end")) {
             playback_t end={0};
             if (xQueueSend(s_playback,&end,0)!=pdTRUE) atomic_store(&s_playing,false);
@@ -392,7 +389,7 @@ static void ws_event(void *p,esp_event_base_t base,int32_t id,void *event)
     if (id==WEBSOCKET_EVENT_CONNECTED) { atomic_store(&s_connected,true); ESP_LOGI(TAG,"Gateway WebSocket connected"); }
     else if (id==WEBSOCKET_EVENT_DISCONNECTED || id==WEBSOCKET_EVENT_ERROR) {
         atomic_store(&s_connected,false); atomic_store(&s_playing,false); n=0;
-        ui("Gateway disconnected\nRetrying...");
+        ui_mode("网关断开\n正在重连",MUSE_MODE_ERROR);
     } else if (id==WEBSOCKET_EVENT_DATA && e->data_len>0) {
         if (e->op_code==0x1) {
             if (e->payload_offset==0) n=0;
@@ -444,9 +441,9 @@ static void http_text(const char *text)
             }
             result[used]=0;
             if (esp_http_client_get_status_code(h)==200) { atomic_store(&s_connected,true); ws_message(result); }
-            else ui("Gateway HTTP error");
+            else ui("网关请求失败");
         }
-    } else ui("Gateway HTTP unavailable");
+    } else ui("无法连接网关");
     esp_http_client_cleanup(h); free(body);
 }
 static void network_task(void *p)
@@ -472,12 +469,12 @@ static void network_task(void *p)
         }
         upload_t job;
         if (xQueueReceive(s_uploads,&job,pdMS_TO_TICKS(50))==pdTRUE) {
-            if (!atomic_load(&s_wifi)) ui("No Wi-Fi. USB setup required");
+            if (!atomic_load(&s_wifi)) ui_mode("未连接网络\n请通过电脑配置",MUSE_MODE_ERROR);
             else if (job.text && !strncmp(s_uri,"http",4)) http_text(job.text);
-            else if (!atomic_load(&s_connected)) ui("Gateway not connected");
+            else if (!atomic_load(&s_connected)) ui_mode("网关尚未连接",MUSE_MODE_ERROR);
             else if (job.text) {
                 cJSON *j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","text");
-                cJSON_AddStringToObject(j,"text",job.text); ws_send_json(j); ui("Thinking...");
+                cJSON_AddStringToObject(j,"text",job.text); ui_mode("正在思考…",MUSE_MODE_THINKING); ws_send_json(j);
             } else if (job.pcm && job.frames) {
                 cJSON *j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","audio.start");
                 cJSON_AddNumberToObject(j,"sample_rate",16000); cJSON_AddNumberToObject(j,"channels",1);
@@ -487,8 +484,8 @@ static void network_task(void *p)
                     size_t count=job.frames-off<640?job.frames-off:640;
                     if (esp_websocket_client_send_bin(s_ws,(char*)(job.pcm+off),count*2,pdMS_TO_TICKS(5000))!=(int)count*2) { ok=false; break; }
                 }
-                if (ok) { j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","audio.end"); ws_send_json(j); ui("Thinking..."); }
-                else ui("Audio upload failed");
+                if (ok) { j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","audio.end"); ui_mode("正在思考…",MUSE_MODE_THINKING); ws_send_json(j); }
+                else ui_mode("语音上传失败",MUSE_MODE_ERROR);
             }
             free(job.pcm); free(job.text);
         }
@@ -502,23 +499,26 @@ static void audio_task(void *p)
         if (atomic_exchange(&s_test_requested,false)) hardware_test();
         playback_t play;
         if (xQueueReceive(s_playback,&play,pdMS_TO_TICKS(10))==pdTRUE) {
-            if (play.pcm && atomic_load(&s_audio_ok) && !atomic_load(&s_record)) muse_audio_write(play.pcm,play.frames);
-            else if (!play.pcm) atomic_store(&s_playing,false);
+            if (play.pcm && atomic_load(&s_audio_ok) && !atomic_load(&s_record)) {
+                yyc_ui_level(play.pcm,play.frames); muse_audio_write(play.pcm,play.frames);
+            }
+            else if (!play.pcm) { atomic_store(&s_playing,false); yyc_ui_mode(MUSE_MODE_IDLE); }
             free(play.pcm); continue;
         }
         if (!atomic_load(&s_record) || !atomic_load(&s_audio_ok) || atomic_load(&s_playing)) continue;
         int16_t *pcm=heap_caps_malloc(MAX_AUDIO_FRAMES*2,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
         size_t frames=0;
-        if (!pcm) { atomic_store(&s_record,false); ui("Audio memory unavailable"); continue; }
-        ui("Listening...\nRelease front to send");
+        if (!pcm) { atomic_store(&s_record,false); ui("语音内存不足"); continue; }
+        ui_mode("正在聆听\n松开正面键发送",MUSE_MODE_LISTENING);
         while (atomic_load(&s_record) && frames+MUSE_AUDIO_CHUNK<=MAX_AUDIO_FRAMES) {
             if (muse_audio_read(chunk,MUSE_AUDIO_CHUNK)!=ESP_OK) break;
+            yyc_ui_level(chunk,MUSE_AUDIO_CHUNK);
             memcpy(pcm+frames,chunk,sizeof(chunk)); frames+=MUSE_AUDIO_CHUNK;
         }
         atomic_store(&s_record,false);
-        if (frames < 1600) { free(pcm); ui("Recording too short"); continue; }
+        if (frames < 1600) { free(pcm); ui_mode("录音太短，请再试一次",MUSE_MODE_IDLE); continue; }
         upload_t job={.pcm=pcm,.frames=frames};
-        if (xQueueSend(s_uploads,&job,0)!=pdTRUE) { free(pcm); ui("Gateway busy"); }
+        if (xQueueSend(s_uploads,&job,0)!=pdTRUE) { free(pcm); ui_mode("网关忙，请稍后再试",MUSE_MODE_ERROR); }
         ESP_LOGI(TAG,"recorded %u mono frames; no raw audio written to disk",(unsigned)frames);
     }
 }
@@ -539,13 +539,9 @@ void app_main(void)
     muse_board=muse_board_get();
     ESP_ERROR_CHECK(muse_board->init());
     lv_indev_t *touch=NULL;
-    if (muse_board->display_start(&touch) && muse_board->display_lock(-1)) {
-        s_font=lv_font_montserrat_14; s_font.fallback=&muse_font_cjk_16;
-        s_label=lv_label_create(lv_screen_active()); lv_obj_set_size(s_label,125,220);
-        lv_label_set_long_mode(s_label,LV_LABEL_LONG_SCROLL);
-        lv_obj_set_style_text_font(s_label,&s_font,0);
-        lv_obj_align(s_label,LV_ALIGN_TOP_LEFT,5,10); lv_label_set_text(s_label,"YYC StickS3\nHardware testing...");
-        muse_board->display_unlock(); muse_board->set_brightness(60);
+    if (muse_board->display_start(&touch)) {
+        if (!yyc_ui_start()) ESP_LOGE(TAG,"avatar UI init failed");
+        muse_board->set_brightness(60);
     }
     atomic_store(&s_audio_ok,muse_audio_init(30,24)==ESP_OK);
     s_imu_ok=yyc_imu_init()==ESP_OK;
@@ -576,6 +572,7 @@ void app_main(void)
     xTaskCreatePinnedToCore(audio_task,"yyc_audio",8192,NULL,6,NULL,1);
     ESP_LOGI(TAG,"READY device=%s; credentials stay on device, provider keys stay on Gateway",s_device);
     for (;;) {
+        yyc_ui_connection(atomic_load(&s_wifi),atomic_load(&s_connected));
         unsigned buttons=muse_board->poll_buttons();
         if (buttons) ESP_LOGI(TAG,"button edges=0x%x (physical)",buttons);
         if ((buttons&MUSE_BTN_TALK_PRESS) && !atomic_load(&s_playing)) atomic_store(&s_record,true);
