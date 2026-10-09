@@ -104,6 +104,33 @@ Mac 还需要 `ffmpeg`。Whisper 每次以受控子进程识别最多 10 秒音�
 .venv/bin/python provision.py --status
 ```
 
+### 需要网页认证的开放 Wi-Fi
+
+先用 USB 诊断网络，再完成该终端的认证，不要把 Mac 自己已登录当作设备已放行：
+
+```json
+{"cmd":"wifi.scan","ssid":"YOUR_OPEN_SSID"}
+{"cmd":"wifi.configure","ssid":"YOUR_OPEN_SSID","password":""}
+{"cmd":"status"}
+{"cmd":"netcheck"}
+```
+
+`wifi.scan` 返回指定 SSID 的 2.4 GHz AP、频道、信号和认证类型。
+`wifi.configure` 只更新 Wi-Fi，保留已有 Gateway 设置；本轮设备的 Gateway 尚未配置，
+因此认证阶段不传输 Gateway Token。该命令不是“暂停已配置的 Gateway”。
+
+`netcheck` 从 **StickS3 自己的网络连接**发出不含认证头的 HTTP 请求，禁止自动跟随跳转，
+通过 USB 返回状态码、Location 和少量网页预览。可用 `url` 指定下一跳的 HTTP(S) URL。
+对于 HTML meta-refresh，需要读取其真实地址并继续由设备探测，不能猜一个普通 Mac 登录链接。
+
+若门户支持按终端 MAC/IP 委托认证，在 Mac 浏览器打开设备收到的专属链接，
+核验表单目标确实为该设备，然后由用户输入自己的获授权账号。代码不自动获取、复制或绕过公司账号认证。
+完成后再从设备重复联网检查；打开页面、登录 Mac、拿到 DHCP 地址均不单独证明设备已放行。
+某些网络按来源 IP 严格绑定，或禁止跨终端认证，需要使用公司提供的设备登记流程或联系 IT。
+
+开放访客网络上不要发送明文 Gateway 凭据或语音；后续 Gateway 接入应使用可验证证书的 TLS。
+网页认证通过也不保证访客 VLAN 能访问 Mac 的 Gateway，还需单独检查局域网连通性。
+
 USB JSON 命令（每行一个 JSON，不需要 `>` 前缀）：
 
 ```json

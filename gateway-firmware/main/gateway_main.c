@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdatomic.h>
 #include "cJSON.h"
 #include "driver/usb_serial_jtag.h"
@@ -66,6 +67,12 @@ static void status(bool send_ws)
     cJSON_AddBoolToObject(j, "gateway", atomic_load(&s_connected));
     cJSON_AddBoolToObject(j, "wifi_configured", s_ssid[0] != 0);
     cJSON_AddBoolToObject(j, "gateway_configured", s_uri[0] != 0);
+    esp_netif_t *sta = atomic_load(&s_wifi) ? esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") : NULL;
+    esp_netif_ip_info_t ip;
+    if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
+        char address[16]; snprintf(address, sizeof(address), IPSTR, IP2STR(&ip.ip));
+        cJSON_AddStringToObject(j, "ip", address);
+    }
     cJSON_AddBoolToObject(j, "display_initialized", s_label != NULL);
     cJSON_AddBoolToObject(j, "audio", atomic_load(&s_audio_ok));
     cJSON_AddBoolToObject(j, "imu", s_imu_ok);
@@ -116,23 +123,97 @@ static bool uri_valid(const char *uri)
         (!strncmp(uri,"http://",7) && strlen(uri)>7) ||
         (!strncmp(uri,"https://",8) && strlen(uri)>8);
 }
-static void configure(cJSON *j)
+static void configure(cJSON *j, bool wifi_only)
 {
-    char ssid[33],pass[65],uri[256],token[129];
+    char ssid[33]={0},pass[65]={0},uri[256]={0},token[129]={0};
     bool ok=copy_json(j,"ssid",ssid,sizeof(ssid)) && ssid[0] &&
-        copy_json(j,"password",pass,sizeof(pass)) &&
+        copy_json(j,"password",pass,sizeof(pass));
+    if (!wifi_only) ok=ok &&
         copy_json(j,"gateway",uri,sizeof(uri)) && uri_valid(uri) &&
         copy_json(j,"token",token,sizeof(token)) && strlen(token)>=16 &&
         !strchr(token,'\r') && !strchr(token,'\n');
     nvs_handle_t h;
     if (ok && nvs_open("yyc_gateway",NVS_READWRITE,&h)==ESP_OK) {
-        ok=nvs_set_str(h,"ssid",ssid)==ESP_OK && nvs_set_str(h,"password",pass)==ESP_OK &&
-            nvs_set_str(h,"gateway",uri)==ESP_OK && nvs_set_str(h,"token",token)==ESP_OK && nvs_commit(h)==ESP_OK;
+        ok=nvs_set_str(h,"ssid",ssid)==ESP_OK && nvs_set_str(h,"password",pass)==ESP_OK;
+        if (ok && !wifi_only) ok=nvs_set_str(h,"gateway",uri)==ESP_OK && nvs_set_str(h,"token",token)==ESP_OK;
+        if (ok) ok=nvs_commit(h)==ESP_OK;
         nvs_close(h);
     } else ok=false;
     memset(pass,0,sizeof(pass)); memset(token,0,sizeof(token));
     printf("@yyc {\"type\":\"configured\",\"ok\":%s}\n",ok?"true":"false"); fflush(stdout);
     if (ok) { ui("Saved. Rebooting..."); vTaskDelay(pdMS_TO_TICKS(600)); esp_restart(); }
+}
+static void scan_network(cJSON *request)
+{
+    char ssid[33];
+    if (!copy_json(request,"ssid",ssid,sizeof(ssid)) || !ssid[0]) {
+        printf("@yyc {\"type\":\"scan\",\"error\":\"provide exact SSID\"}\n"); return;
+    }
+    wifi_scan_config_t cfg={.ssid=(uint8_t*)ssid};
+    esp_err_t err=esp_wifi_scan_start(&cfg,true);
+    cJSON *j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","scan");
+    cJSON_AddStringToObject(j,"ssid",ssid); cJSON_AddStringToObject(j,"error",esp_err_to_name(err));
+    if (err==ESP_OK) {
+        wifi_ap_record_t *records=calloc(16,sizeof(*records)); uint16_t count=16;
+        err=records ? esp_wifi_scan_get_ap_records(&count,records) : ESP_ERR_NO_MEM;
+        cJSON *aps=cJSON_AddArrayToObject(j,"aps");
+        if (err==ESP_OK) for (unsigned i=0;i<count;i++) {
+            cJSON *ap=cJSON_CreateObject();
+            cJSON_AddNumberToObject(ap,"channel",records[i].primary);
+            cJSON_AddNumberToObject(ap,"rssi",records[i].rssi);
+            cJSON_AddNumberToObject(ap,"auth_mode",records[i].authmode);
+            cJSON_AddStringToObject(ap,"security",records[i].authmode==WIFI_AUTH_OPEN ? "open" :
+                records[i].authmode==WIFI_AUTH_WPA2_ENTERPRISE ? "enterprise" : "secured");
+            cJSON_AddItemToArray(aps,ap);
+        }
+        free(records);
+        esp_wifi_clear_ap_list();
+    }
+    usb_json(j);
+}
+typedef struct { char location[1024]; char body[257]; size_t used; } net_probe_t;
+static esp_err_t probe_event(esp_http_client_event_t *event)
+{
+    net_probe_t *p=event->user_data;
+    if (event->event_id==HTTP_EVENT_ON_HEADER && event->header_key && event->header_value &&
+        !strcasecmp(event->header_key,"Location")) strlcpy(p->location,event->header_value,sizeof(p->location));
+    else if (event->event_id==HTTP_EVENT_ON_DATA && event->data_len>0 && p->used<sizeof(p->body)-1) {
+        size_t n=event->data_len;
+        if (n>sizeof(p->body)-1-p->used) n=sizeof(p->body)-1-p->used;
+        memcpy(p->body+p->used,event->data,n);p->used+=n;p->body[p->used]=0;
+    }
+    return ESP_OK;
+}
+static void network_check(cJSON *request)
+{
+    const char *url="http://captive.apple.com/hotspot-detect.html";
+    cJSON *u=cJSON_GetObjectItemCaseSensitive(request,"url");
+    if (u && (!cJSON_IsString(u) || strlen(u->valuestring)>1024 ||
+        (strncmp(u->valuestring,"http://",7) && strncmp(u->valuestring,"https://",8)))) {
+        printf("@yyc {\"type\":\"netcheck\",\"error\":\"invalid HTTP(S) URL\"}\n"); return;
+    }
+    if (u) url=u->valuestring;
+    cJSON *j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","netcheck");
+    cJSON_AddStringToObject(j,"url",url);
+    if (!atomic_load(&s_wifi)) { cJSON_AddStringToObject(j,"error","no Wi-Fi lease"); usb_json(j); return; }
+    net_probe_t *probe=calloc(1,sizeof(*probe));
+    if (!probe) { cJSON_AddStringToObject(j,"error","no memory"); usb_json(j); return; }
+    esp_http_client_config_t cfg={.url=url,.timeout_ms=8000,.disable_auto_redirect=true,
+        .event_handler=probe_event,.user_data=probe,.crt_bundle_attach=esp_crt_bundle_attach};
+    esp_http_client_handle_t client=esp_http_client_init(&cfg);
+    esp_err_t err=client ? esp_http_client_perform(client) : ESP_FAIL;
+    int code=client ? esp_http_client_get_status_code(client) : 0;
+    cJSON_AddStringToObject(j,"error",esp_err_to_name(err)); cJSON_AddNumberToObject(j,"http_status",code);
+    cJSON_AddStringToObject(j,"redirect",probe->location); cJSON_AddStringToObject(j,"body_preview",probe->body);
+    bool success=err==ESP_OK && code==200 && strstr(probe->body,"<TITLE>Success</TITLE>") &&
+        !strcmp(url,"http://captive.apple.com/hotspot-detect.html");
+    cJSON_AddBoolToObject(j,"success_page",success);
+    if (probe->location[0] || (err==ESP_OK && code==200 && !success && !u))
+        ui("Wi-Fi connected\nWeb login required\nCheck browser on Mac");
+    else if (success && !s_uri[0]) ui("Network check OK\nUSB Gateway setup\nrequired");
+    if (client) { esp_http_client_cleanup(client); }
+    free(probe);
+    usb_json(j);
 }
 static void serial_task(void *p)
 {
@@ -151,7 +232,10 @@ static void serial_task(void *p)
         if (j) {
             cJSON *cmd=cJSON_GetObjectItemCaseSensitive(j,"cmd");
             if (cJSON_IsString(cmd)) {
-                if (!strcmp(cmd->valuestring,"configure")) configure(j);
+                if (!strcmp(cmd->valuestring,"configure")) configure(j,false);
+                else if (!strcmp(cmd->valuestring,"wifi.configure")) configure(j,true);
+                else if (!strcmp(cmd->valuestring,"wifi.scan")) scan_network(j);
+                else if (!strcmp(cmd->valuestring,"netcheck")) network_check(j);
                 else if (!strcmp(cmd->valuestring,"status")) status(false);
                 else if (!strcmp(cmd->valuestring,"test")) atomic_store(&s_test_requested,true);
                 else if (!strcmp(cmd->valuestring,"say")) {
@@ -176,7 +260,7 @@ static void wifi_event(void *p,esp_event_base_t base,int32_t id,void *data)
         atomic_store(&s_wifi,true);
         ip_event_got_ip_t *e=data;
         ESP_LOGI(TAG,"Wi-Fi IP: " IPSTR,IP2STR(&e->ip_info.ip));
-        ui("Wi-Fi connected\nGateway connecting...");
+        ui(s_uri[0] ? "Wi-Fi connected\nGateway connecting..." : "Wi-Fi connected\nUSB network check");
     } else if (base==WIFI_EVENT && id==WIFI_EVENT_STA_DISCONNECTED) {
         atomic_store(&s_wifi,false); atomic_store(&s_connected,false);
         ui("Wi-Fi disconnected\nRetrying...");
