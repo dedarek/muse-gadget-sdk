@@ -5,10 +5,12 @@
 #include <string.h>
 #include <strings.h>
 #include <stdatomic.h>
+#include <sys/time.h>
 #include "cJSON.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_eap_client.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -36,6 +38,9 @@ static char s_headers[196];
 static esp_websocket_client_handle_t s_ws;
 static atomic_bool s_wifi, s_connected, s_record, s_playing, s_audio_ok;
 static atomic_bool s_test_requested;
+static atomic_bool s_enterprise_active, s_enterprise_configuring;
+static atomic_int s_wifi_reason;
+static char *s_enterprise_ca; /* EAP API borrows this public CA pointer. RAM only. */
 static lv_obj_t *s_label;
 static lv_font_t s_font;
 LV_FONT_DECLARE(muse_font_cjk_16);
@@ -67,6 +72,9 @@ static void status(bool send_ws)
     cJSON_AddBoolToObject(j, "gateway", atomic_load(&s_connected));
     cJSON_AddBoolToObject(j, "wifi_configured", s_ssid[0] != 0);
     cJSON_AddBoolToObject(j, "gateway_configured", s_uri[0] != 0);
+    cJSON_AddBoolToObject(j, "enterprise_supported", true);
+    cJSON_AddBoolToObject(j, "enterprise_active", atomic_load(&s_enterprise_active));
+    cJSON_AddNumberToObject(j, "wifi_disconnect_reason", atomic_load(&s_wifi_reason));
     esp_netif_t *sta = atomic_load(&s_wifi) ? esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") : NULL;
     esp_netif_ip_info_t ip;
     if (sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
@@ -123,6 +131,77 @@ static bool uri_valid(const char *uri)
         (!strncmp(uri,"http://",7) && strlen(uri)>7) ||
         (!strncmp(uri,"https://",8) && strlen(uri)>8);
 }
+static void wipe(void *buffer, size_t n)
+{
+    volatile unsigned char *p=buffer;
+    while (n--) *p++=0;
+}
+static void enterprise_configure(cJSON *request)
+{
+    char ssid[33],username[128],identity[128],server[256];
+    cJSON *password=cJSON_GetObjectItemCaseSensitive(request,"password");
+    cJSON *ca=cJSON_GetObjectItemCaseSensitive(request,"ca_cert");
+    cJSON *clock=cJSON_GetObjectItemCaseSensitive(request,"unix_time");
+    bool valid=copy_json(request,"ssid",ssid,sizeof(ssid)) && ssid[0] &&
+        copy_json(request,"username",username,sizeof(username)) && username[0] &&
+        copy_json(request,"server_name",server,sizeof(server)) && strchr(server,'.') && !strchr(server,'*') &&
+        cJSON_IsString(password) && password->valuestring[0] && strlen(password->valuestring)<=256 &&
+        cJSON_IsString(ca) && strlen(ca->valuestring)<8192 &&
+        strstr(ca->valuestring,"-----BEGIN CERTIFICATE-----") &&
+        cJSON_IsNumber(clock) && clock->valuedouble>=1704067200.0 && clock->valuedouble<=4102444800.0;
+    if (!valid || atomic_load(&s_enterprise_active)) {
+        printf("@yyc {\"type\":\"enterprise\",\"ok\":false,\"error\":\"invalid secure configuration or attempt already active; restart before retry\"}\n");
+        return;
+    }
+    if (!copy_json(request,"identity",identity,sizeof(identity))) strlcpy(identity,username,sizeof(identity));
+    if (!identity[0]) strlcpy(identity,username,sizeof(identity));
+    s_enterprise_ca=strdup(ca->valuestring);
+    if (!s_enterprise_ca) { printf("@yyc {\"type\":\"enterprise\",\"ok\":false,\"error\":\"no memory\"}\n"); return; }
+    /* Stop automatic reconnects before changing network. Only one explicit
+     * credential attempt is allowed in this boot, avoiding account lockouts. */
+    atomic_store(&s_enterprise_active,true); atomic_store(&s_enterprise_configuring,true);
+    atomic_store(&s_wifi_reason,0);
+    esp_wifi_disconnect();
+    for (int i=0;i<100 && atomic_load(&s_wifi);i++) vTaskDelay(pdMS_TO_TICKS(10));
+    wifi_config_t cfg={0}; strlcpy((char*)cfg.sta.ssid,ssid,sizeof(cfg.sta.ssid));
+    cfg.sta.scan_method=WIFI_ALL_CHANNEL_SCAN;
+    cfg.sta.sort_method=WIFI_CONNECT_AP_BY_SIGNAL;
+    cfg.sta.threshold.rssi=-127;
+    cfg.sta.threshold.authmode=WIFI_AUTH_WPA2_ENTERPRISE;
+    cfg.sta.pmf_cfg.capable=true;
+    esp_err_t err=esp_wifi_set_config(WIFI_IF_STA,&cfg);
+    struct timeval now={.tv_sec=(time_t)clock->valuedouble,.tv_usec=0};
+    if (err==ESP_OK && settimeofday(&now,NULL)!=0) err=ESP_FAIL;
+    if (err==ESP_OK) err=esp_eap_client_set_eap_methods(ESP_EAP_TYPE_PEAP);
+    if (err==ESP_OK) err=esp_eap_client_use_default_cert_bundle(false);
+    if (err==ESP_OK) err=esp_eap_client_set_ca_cert((const unsigned char*)s_enterprise_ca,strlen(s_enterprise_ca)+1);
+    if (err==ESP_OK) err=esp_eap_client_set_domain_name(server);
+    if (err==ESP_OK) err=esp_eap_client_set_disable_time_check(false);
+    if (err==ESP_OK) err=esp_eap_client_set_identity((const unsigned char*)identity,strlen(identity));
+    if (err==ESP_OK) err=esp_eap_client_set_username((const unsigned char*)username,strlen(username));
+    if (err==ESP_OK) err=esp_eap_client_set_password((const unsigned char*)password->valuestring,strlen(password->valuestring));
+    if (err==ESP_OK) err=esp_wifi_sta_enterprise_enable();
+    strlcpy(s_ssid,ssid,sizeof(s_ssid)); wipe(s_password,sizeof(s_password));
+    atomic_store(&s_enterprise_configuring,false);
+    if (err==ESP_OK) { ui("Enterprise Wi-Fi\nAuthenticating...\nOne attempt only"); err=esp_wifi_connect(); }
+    printf("@yyc {\"type\":\"enterprise\",\"ok\":%s,\"error\":\"%s\",\"credentials_persisted\":false,\"server_validation\":true}\n",
+        err==ESP_OK?"true":"false",esp_err_to_name(err)); fflush(stdout);
+    if (err!=ESP_OK) ui("Enterprise setup failed\nNo automatic retry\nCheck local tool");
+    wipe(username,sizeof(username));wipe(identity,sizeof(identity));
+    /* No NVS writes: password is copied by EAP into volatile RAM only.
+     * Reboot restores the previous non-enterprise Wi-Fi configuration. */
+}
+static void gateway_session(cJSON *request)
+{
+    char uri[256]={0},token[129]={0};
+    bool ok=atomic_load(&s_enterprise_active) && atomic_load(&s_wifi) && !s_ws &&
+        copy_json(request,"gateway",uri,sizeof(uri)) && uri_valid(uri) &&
+        copy_json(request,"token",token,sizeof(token)) && strlen(token)>=16 &&
+        !strchr(token,'\r') && !strchr(token,'\n');
+    if (ok) { strlcpy(s_uri,uri,sizeof(s_uri)); strlcpy(s_token,token,sizeof(s_token)); }
+    wipe(token,sizeof(token));
+    printf("@yyc {\"type\":\"gateway_session\",\"ok\":%s,\"credentials_persisted\":false}\n",ok?"true":"false"); fflush(stdout);
+}
 static void configure(cJSON *j, bool wifi_only)
 {
     char ssid[33]={0},pass[65]={0},uri[256]={0},token[129]={0};
@@ -149,16 +228,20 @@ static void scan_network(cJSON *request)
     if (!copy_json(request,"ssid",ssid,sizeof(ssid)) || !ssid[0]) {
         printf("@yyc {\"type\":\"scan\",\"error\":\"provide exact SSID\"}\n"); return;
     }
-    wifi_scan_config_t cfg={.ssid=(uint8_t*)ssid};
+    bool all=!strcmp(ssid,"*");
+    wifi_scan_config_t cfg={.ssid=all?NULL:(uint8_t*)ssid,.show_hidden=true};
     esp_err_t err=esp_wifi_scan_start(&cfg,true);
     cJSON *j=cJSON_CreateObject(); cJSON_AddStringToObject(j,"type","scan");
     cJSON_AddStringToObject(j,"ssid",ssid); cJSON_AddStringToObject(j,"error",esp_err_to_name(err));
     if (err==ESP_OK) {
-        wifi_ap_record_t *records=calloc(16,sizeof(*records)); uint16_t count=16;
+        wifi_ap_record_t *records=calloc(64,sizeof(*records)); uint16_t count=64;
         err=records ? esp_wifi_scan_get_ap_records(&count,records) : ESP_ERR_NO_MEM;
         cJSON *aps=cJSON_AddArrayToObject(j,"aps");
         if (err==ESP_OK) for (unsigned i=0;i<count;i++) {
             cJSON *ap=cJSON_CreateObject();
+            cJSON_AddStringToObject(ap,"ssid",(const char*)records[i].ssid);
+            char bssid[18]; snprintf(bssid,sizeof(bssid),"%02x:%02x:%02x:%02x:%02x:%02x",records[i].bssid[0],records[i].bssid[1],records[i].bssid[2],records[i].bssid[3],records[i].bssid[4],records[i].bssid[5]);
+            cJSON_AddStringToObject(ap,"bssid",bssid);
             cJSON_AddNumberToObject(ap,"channel",records[i].primary);
             cJSON_AddNumberToObject(ap,"rssi",records[i].rssi);
             cJSON_AddNumberToObject(ap,"auth_mode",records[i].authmode);
@@ -219,14 +302,16 @@ static void serial_task(void *p)
 {
     (void)p;
     usb_serial_jtag_driver_config_t cfg=USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    cfg.rx_buffer_size=4096; cfg.tx_buffer_size=4096;
+    cfg.rx_buffer_size=16384; cfg.tx_buffer_size=4096;
     if (usb_serial_jtag_driver_install(&cfg)!=ESP_OK) { vTaskDelete(NULL); return; }
-    char line[2048]; size_t n=0; bool overflow=false;
+    enum { LINE_SIZE=16384 };
+    char *line=malloc(LINE_SIZE); size_t n=0; bool overflow=false;
+    if (!line) { vTaskDelete(NULL); return; }
     for (;;) {
         uint8_t c;
         if (usb_serial_jtag_read_bytes(&c,1,pdMS_TO_TICKS(100))!=1) continue;
         if (c=='\r') continue;
-        if (c!='\n') { if (n+1<sizeof(line)) line[n++]=c; else overflow=true; continue; }
+        if (c!='\n') { if (n+1<LINE_SIZE) line[n++]=c; else overflow=true; continue; }
         line[n]=0;
         cJSON *j=overflow?NULL:cJSON_Parse(line);
         if (j) {
@@ -236,6 +321,8 @@ static void serial_task(void *p)
                 else if (!strcmp(cmd->valuestring,"wifi.configure")) configure(j,true);
                 else if (!strcmp(cmd->valuestring,"wifi.scan")) scan_network(j);
                 else if (!strcmp(cmd->valuestring,"netcheck")) network_check(j);
+                else if (!strcmp(cmd->valuestring,"enterprise.configure")) enterprise_configure(j);
+                else if (!strcmp(cmd->valuestring,"gateway.session")) gateway_session(j);
                 else if (!strcmp(cmd->valuestring,"status")) status(false);
                 else if (!strcmp(cmd->valuestring,"test")) atomic_store(&s_test_requested,true);
                 else if (!strcmp(cmd->valuestring,"say")) {
@@ -248,9 +335,13 @@ static void serial_task(void *p)
                     atomic_store(&s_record,true); vTaskDelay(pdMS_TO_TICKS(1000)); atomic_store(&s_record,false);
                 }
             }
+            cJSON *secret=cJSON_GetObjectItemCaseSensitive(j,"password");
+            if (cJSON_IsString(secret)) wipe(secret->valuestring,strlen(secret->valuestring));
+            secret=cJSON_GetObjectItemCaseSensitive(j,"token");
+            if (cJSON_IsString(secret)) wipe(secret->valuestring,strlen(secret->valuestring));
             cJSON_Delete(j);
         } else printf("@yyc {\"type\":\"error\",\"message\":\"invalid command\"}\n");
-        memset(line,0,sizeof(line)); n=0; overflow=false;
+        wipe(line,LINE_SIZE); n=0; overflow=false;
     }
 }
 static void wifi_event(void *p,esp_event_base_t base,int32_t id,void *data)
@@ -263,7 +354,12 @@ static void wifi_event(void *p,esp_event_base_t base,int32_t id,void *data)
         ui(s_uri[0] ? "Wi-Fi connected\nGateway connecting..." : "Wi-Fi connected\nUSB network check");
     } else if (base==WIFI_EVENT && id==WIFI_EVENT_STA_DISCONNECTED) {
         atomic_store(&s_wifi,false); atomic_store(&s_connected,false);
-        ui("Wi-Fi disconnected\nRetrying...");
+        wifi_event_sta_disconnected_t *e=data;
+        atomic_store(&s_wifi_reason,e ? e->reason : 0);
+        if (atomic_load(&s_enterprise_active) && !atomic_load(&s_enterprise_configuring)) {
+            ESP_LOGW(TAG,"Enterprise disconnect reason=%u; no automatic credential retry",e?e->reason:0);
+            ui("Enterprise Wi-Fi failed\nNo automatic retry\nCheck local tool");
+        } else ui("Wi-Fi disconnected\nRetrying...");
     }
 }
 static void ws_message(const char *data)
@@ -359,7 +455,7 @@ static void network_task(void *p)
     int retry=0; int64_t next=0,last_status=0;
     for (;;) {
         int64_t now=esp_timer_get_time();
-        if (s_ssid[0] && !atomic_load(&s_wifi) && now>=next) {
+        if (!atomic_load(&s_enterprise_active) && s_ssid[0] && !atomic_load(&s_wifi) && now>=next) {
             esp_wifi_connect(); retry=retry<5?retry+1:5; next=now+(1<<retry)*1000000LL;
         }
         if (atomic_load(&s_wifi)) {

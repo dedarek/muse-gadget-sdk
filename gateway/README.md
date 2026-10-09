@@ -131,6 +131,27 @@ Mac 还需要 `ffmpeg`。Whisper 每次以受控子进程识别最多 10 秒音�
 开放访客网络上不要发送明文 Gateway 凭据或语音；后续 Gateway 接入应使用可验证证书的 TLS。
 网页认证通过也不保证访客 VLAN 能访问 Mac 的 Gateway，还需单独检查局域网连通性。
 
+### WPA2-Enterprise / PEAP 企业网络
+
+新增的企业认证只在 RAM 中配置，不写企业密码到 NVS/Flash，也不会烧写 eFuse。
+使用公司提供或当前设备明确受信任的公共 CA 和认证服务器域名，始终验证服务器证书及有效期。
+不能用网页认证替代 802.1X，也不能为了连接成功而关闭证书校验。
+
+```sh
+.venv/bin/python enterprise_provision.py --port /dev/cu.usbmodem11201 \
+  --ssid YOUR_ENTERPRISE_SSID --server-name radius.example.com --ca-cert /path/to/company-ca.pem
+```
+
+账号和密码通过本机隐藏输入获取，不作为命令行参数，不写日志。
+当前实现支持 PEAP（账号密码）；如公司要求设备客户端证书，应由 IT 签发，不要复制 Mac 的私钥。
+每次启动只允许一个明确的企业凭据配置；认证失败不自动重复尝试，以免锁定账户。
+断电或重启后这些临时凭据消失，恢复此前保存的普通 Wi-Fi 配置，需要重新进行企业配网。
+
+企业 Wi-Fi 已认证且拿到 IP 后，可用 `gateway.session` 仅在 RAM 中绑定 Gateway URI/Token，
+不重启设备、不持久化 Token；重启后不会把临时 Token 自动发送到此前的开放网络。
+该入口只接受当前已连接的企业认证会话。
+`wifi.scan` 的 `ssid="*"` 可读取设备当前可见 AP 的实际 SSID/BSSID，避免名称或大小写误判。
+
 USB JSON 命令（每行一个 JSON，不需要 `>` 前缀）：
 
 ```json
